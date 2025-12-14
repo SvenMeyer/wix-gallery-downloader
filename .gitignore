@@ -1,0 +1,15 @@
+# Virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Downloaded images
+sharks-sardines/
+sardine_school_images/
+
+# Debug files
+debug*.png
+error_screenshot.png
+
+# OS files
+.DS_Store

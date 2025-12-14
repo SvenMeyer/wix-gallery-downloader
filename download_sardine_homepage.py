@@ -3,14 +3,17 @@
 Download Sardine gallery by starting from homepage and clicking into the gallery
 """
 
-import os
+import json
 import time
 import requests
+from pathlib import Path
 from playwright.sync_api import sync_playwright
 import re
 
-OUTPUT_DIR = "sharks-sardines"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+OUTPUT_DIR = Path("sharks-sardines")
+OUTPUT_DIR.mkdir(exist_ok=True)
+GALLERY_COMPONENT_ID = "comp-mizbkpxe"
+WARMUP_SCRIPT_ID = "wix-warmup-data"
 
 def download_image_from_url(url, filename):
     """Download an image from URL"""
@@ -31,6 +34,83 @@ def get_original_image_url(img_src):
     if match:
         return match.group(1), match.group(2)
     return None, None
+
+def parse_gallery_metadata(page):
+    """Read inline warmup JSON and extract gallery metadata"""
+    try:
+        script_text = page.eval_on_selector(f"#{WARMUP_SCRIPT_ID}", "el => el.textContent")
+        if not script_text:
+            return {}
+        data = json.loads(script_text)
+        warmup_data = data.get("appsWarmupData", {})
+        for payload in warmup_data.values():
+            gallery_data = payload.get(f"{GALLERY_COMPONENT_ID}_galleryData")
+            app_settings = payload.get(f"{GALLERY_COMPONENT_ID}_appSettings", {})
+            if gallery_data:
+                return {
+                    "total": gallery_data.get("totalItemsCount"),
+                    "gallery_id": app_settings.get("galleryId"),
+                }
+    except Exception:
+        pass
+    return {}
+
+def discover_existing_images():
+    """Return previously downloaded image ids and the highest sequence number"""
+    id_pattern = re.compile(r"sardine_(\d+)_([a-f0-9]+)\.[a-z]+$")
+    existing = {}
+    highest_seq = 0
+    for file_path in OUTPUT_DIR.glob("sardine_*.*"):
+        match = id_pattern.match(file_path.name)
+        if match:
+            seq = int(match.group(1))
+            img_id = match.group(2)
+            highest_seq = max(highest_seq, seq)
+            existing[img_id] = file_path
+    return existing, highest_seq
+
+def go_to_next_image(page):
+    """Advance the gallery using arrow buttons, fallback to keyboard"""
+    selectors = [
+        'button[data-hook="nav-arrow-next"]',
+        '#pro-gallery-pro-gallery-fullscreen-wrapper button[data-hook="nav-arrow-next"]',
+        '#pro-gallery-pro-gallery-fullscreen-wrapper .slideshow-arrow:last-of-type',
+        '.pro-gallery-parent-container button[class*=\"arrow\"]:last-child',
+    ]
+
+    for selector in selectors:
+        arrow = None
+        try:
+            arrow = page.query_selector(selector)
+        except Exception:
+            continue
+
+        if not arrow:
+            continue
+
+        try:
+            class_attr = (arrow.get_attribute("class") or "").lower()
+            aria_disabled = (arrow.get_attribute("aria-disabled") or "").lower() == "true"
+            is_disabled = "disabled" in class_attr or aria_disabled
+            if is_disabled:
+                return False, "disabled"
+            if not arrow.is_visible():
+                continue
+            arrow.click()
+            return True, "button"
+        except Exception:
+            try:
+                page.evaluate("(el) => el.click()", arrow)
+                return True, "script"
+            except Exception:
+                continue
+
+    # Keyboard fallback
+    try:
+        page.keyboard.press("ArrowRight")
+        return True, "keyboard"
+    except Exception:
+        return False, "unreachable"
 
 def main():
     print("="*70)
@@ -76,8 +156,19 @@ def main():
             else:
                 print("WARNING: Might not be in fullscreen mode")
 
+            existing_images, highest_sequence = discover_existing_images()
+            if existing_images:
+                print(f"Found {len(existing_images)} images already saved locally")
+
+            metadata = parse_gallery_metadata(page)
+            expected_total = metadata.get("total") or 50
+            if metadata.get("gallery_id"):
+                print(f"Gallery ID: {metadata['gallery_id']} (expects {expected_total} images)")
+            else:
+                print(f"Gallery metadata unavailable, defaulting to {expected_total} images")
+
             downloaded = 0
-            seen_images = set()
+            session_seen_ids = set()
             consecutive_duplicates = 0
 
             print("\nWarming up gallery with a few navigation presses...")
@@ -163,77 +254,58 @@ def main():
                 original_url, ext = get_original_image_url(img_src)
 
                 # Debug: show what we got
-                if original_url:
-                    img_id = re.search(r'dd09ca_([a-f0-9]+)', original_url).group(1)
-                    print(f"  Image ID: {img_id[:12]}...")
+                if not original_url:
+                    print(f"  Could not parse URL")
+                    continue
 
-                if original_url:
-                    if original_url in seen_images:
-                        consecutive_duplicates += 1
-                        print(f"  Already downloaded (dup #{consecutive_duplicates})")
-                        # High threshold - gallery might take time to loop or arrow might not disable
-                        if consecutive_duplicates >= 10:
-                            print("\n  ✓ End of gallery detected (10 consecutive duplicates)")
-                            break
+                id_match = re.search(r'dd09ca_([a-f0-9]+)', original_url)
+                if not id_match:
+                    print("  Unable to extract image id")
+                    continue
+
+                img_id = id_match.group(1)
+                print(f"  Image ID: {img_id[:12]}...")
+
+                if img_id in session_seen_ids:
+                    consecutive_duplicates += 1
+                    print(f"  Already downloaded (dup #{consecutive_duplicates})")
+                    if consecutive_duplicates >= 10 or len(session_seen_ids) >= expected_total:
+                        print("\n  ✓ End of gallery detected (duplicates threshold)")
+                        break
+                else:
+                    consecutive_duplicates = 0
+                    session_seen_ids.add(img_id)
+
+                    if len(session_seen_ids) >= expected_total:
+                        print("  ✓ All expected images have been seen")
+
+                    if img_id in existing_images:
+                        print("  Skipping download (already on disk)")
                     else:
-                        consecutive_duplicates = 0
-                        seen_images.add(original_url)
-
-                        img_id = re.search(r'dd09ca_([a-f0-9]+)', original_url).group(1)
-                        filename = f"{OUTPUT_DIR}/sardine_{downloaded+1:03d}_{img_id}.{ext}"
+                        seq_number = highest_sequence + downloaded + 1
+                        filename = OUTPUT_DIR / f"sardine_{seq_number:03d}_{img_id}.{ext}"
 
                         print(f"  Downloading...")
                         if download_image_from_url(original_url, filename):
-                            size_mb = os.path.getsize(filename) / 1024 / 1024
+                            size_mb = filename.stat().st_size / 1024 / 1024
                             print(f"  ✓ Saved ({size_mb:.2f} MB)")
                             downloaded += 1
+                        else:
+                            print("  ✗ Download failed")
                 else:
                     print(f"  Could not parse URL")
 
                 # Check if we can navigate to next image
-                # Look for the next arrow button to see if we're on the last image
-                next_arrow_selectors = [
-                    'button.slideshow-arrow:last-of-type',
-                    '.slideshow-arrow:nth-of-type(2)',
-                    '.pro-gallery-parent-container button[class*="arrow"]:last-child',
-                ]
+                moved, reason = go_to_next_image(page)
+                if not moved:
+                    if reason == "disabled":
+                        print("  ⚠ Next arrow disabled - reached last image.")
+                    else:
+                        print(f"  ⚠ Unable to navigate further ({reason}).")
+                    break
 
-                next_arrow = None
-                for selector in next_arrow_selectors:
-                    try:
-                        arrows = page.query_selector_all(selector)
-                        if len(arrows) > 0:
-                            next_arrow = arrows[-1] if len(arrows) > 1 else arrows[0]
-                            if next_arrow:
-                                break
-                    except:
-                        continue
-
-                # Check if next arrow is disabled/hidden (indicates last image)
-                can_go_next = True  # Default to true
-                if next_arrow:
-                    try:
-                        is_visible = next_arrow.is_visible()
-                        # Also check for disabled class or opacity
-                        class_name = next_arrow.get_attribute('class') or ''
-                        is_disabled = 'disabled' in class_name.lower()
-
-                        can_go_next = is_visible and not is_disabled
-
-                        if not can_go_next:
-                            print(f"  ⚠ Next arrow is disabled - this is the LAST image!")
-                            print(f"\n  ✓ Reached end of gallery (arrow disabled)")
-                            break
-                    except Exception as e:
-                        # If we can't check, assume we can continue
-                        pass
-
-                # Navigate using keyboard
-                page.keyboard.press("ArrowRight")
-                print("  → Next")
-
-                # Wait for transition
-                time.sleep(0.5)
+                print(f"  → Next ({reason})")
+                time.sleep(0.8)
 
             print(f"\n{'='*70}")
             print(f"✓ Downloaded {downloaded} unique images!")
