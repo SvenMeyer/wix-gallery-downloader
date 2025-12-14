@@ -4,6 +4,7 @@ Download Sardine gallery by starting from homepage and clicking into the gallery
 """
 
 import json
+import sys
 import time
 import requests
 from pathlib import Path
@@ -14,6 +15,7 @@ OUTPUT_DIR = Path("sharks-sardines")
 OUTPUT_DIR.mkdir(exist_ok=True)
 GALLERY_COMPONENT_ID = "comp-mizbkpxe"
 WARMUP_SCRIPT_ID = "wix-warmup-data"
+MAX_DUPLICATE_STREAK = 1
 
 def download_image_from_url(url, filename):
     """Download an image from URL"""
@@ -69,48 +71,154 @@ def discover_existing_images():
             existing[img_id] = file_path
     return existing, highest_seq
 
-def go_to_next_image(page):
-    """Advance the gallery using arrow buttons, fallback to keyboard"""
+def focus_gallery(page):
+    """Click inside the fullscreen gallery to ensure keyboard events go to it"""
+    focus_selectors = [
+        "#pro-gallery-pro-gallery-fullscreen-wrapper",
+        ".pro-gallery-parent-container",
+        "#pro-gallery-pro-gallery-fullscreen-wrapper canvas",  # rare overlay
+    ]
+    for selector in focus_selectors:
+        try:
+            element = page.query_selector(selector)
+            if element and element.is_visible():
+                box = element.bounding_box()
+                if box:
+                    x = box["x"] + box["width"] / 2
+                    y = box["y"] + box["height"] / 2
+                    page.mouse.click(x, y)
+                    return True
+        except Exception:
+            continue
+    return False
+
+def get_next_arrow_state(page):
+    """Return (status, element) where status is enabled/disabled/missing"""
     selectors = [
-        'button[data-hook="nav-arrow-next"]',
         '#pro-gallery-pro-gallery-fullscreen-wrapper button[data-hook="nav-arrow-next"]',
-        '#pro-gallery-pro-gallery-fullscreen-wrapper .slideshow-arrow:last-of-type',
-        '.pro-gallery-parent-container button[class*=\"arrow\"]:last-child',
+        '#pro-gallery-pro-gallery-fullscreen-wrapper .nav-arrows-container button:last-of-type',
+        '.pro-gallery-parent-container button.slideshow-arrow:last-of-type',
+        'button[data-hook="nav-arrow-next"]',
     ]
 
     for selector in selectors:
-        arrow = None
         try:
             arrow = page.query_selector(selector)
         except Exception:
-            continue
+            arrow = None
 
         if not arrow:
             continue
 
         try:
-            class_attr = (arrow.get_attribute("class") or "").lower()
-            aria_disabled = (arrow.get_attribute("aria-disabled") or "").lower() == "true"
-            is_disabled = "disabled" in class_attr or aria_disabled
-            if is_disabled:
-                return False, "disabled"
-            if not arrow.is_visible():
-                continue
-            arrow.click()
-            return True, "button"
+            box = arrow.bounding_box()
+            visible = arrow.is_visible()
         except Exception:
-            try:
-                page.evaluate("(el) => el.click()", arrow)
-                return True, "script"
-            except Exception:
-                continue
+            box = None
+            visible = False
 
-    # Keyboard fallback
+        if not box or box["width"] <= 0 or box["height"] <= 0 or not visible:
+            continue
+
+        try:
+            arrow_eval = arrow.evaluate(
+                """(el) => {
+                    const style = window.getComputedStyle(el);
+                    const hidden = style.display === 'none' ||
+                                   style.visibility === 'hidden' ||
+                                   parseFloat(style.opacity || '1') === 0 ||
+                                   el.offsetParent === null;
+                    const disabled = el.hasAttribute('disabled') ||
+                        el.getAttribute('aria-disabled') === 'true' ||
+                        style.pointerEvents === 'none';
+                    return { hidden, disabled };
+                }"""
+            )
+        except Exception:
+            arrow_eval = {"hidden": False, "disabled": False}
+
+        if arrow_eval.get("hidden"):
+            continue
+
+        inner_disabled = False
+        try:
+            inner_btn = arrow.query_selector("button")
+            if inner_btn:
+                inner_eval = inner_btn.evaluate(
+                    """(el) => {
+                        const style = window.getComputedStyle(el);
+                        const hidden = style.display === 'none' ||
+                                       style.visibility === 'hidden' ||
+                                       parseFloat(style.opacity || '1') === 0 ||
+                                       el.offsetParent === null;
+                        const disabled = el.hasAttribute('disabled') ||
+                            el.getAttribute('aria-disabled') === 'true' ||
+                            style.pointerEvents === 'none';
+                        return { hidden, disabled };
+                    }"""
+                )
+                inner_disabled = inner_eval.get("disabled", False)
+                if inner_eval.get("hidden"):
+                    continue
+        except Exception:
+            pass
+
+        if arrow_eval.get("disabled") or inner_disabled:
+            return "disabled", arrow
+
+        return "enabled", arrow
+
+    return "missing", None
+
+def go_to_next_image(page):
+    """Advance the gallery using arrow buttons, fallback to keyboard"""
+    status, arrow_ref = get_next_arrow_state(page)
+
+    if status != "enabled" or not arrow_ref:
+        return False, status
+
+    # Try to ensure gallery captures keyboard events
+    focus_gallery(page)
+
     try:
         page.keyboard.press("ArrowRight")
         return True, "keyboard"
     except Exception:
-        return False, "unreachable"
+        pass
+
+    # Keyboard failed, try clicking arrow explicitly
+    try:
+        arrow_ref.click()
+        return True, "button"
+    except Exception:
+        try:
+            page.evaluate("(el) => el.click()", arrow_ref)
+            return True, "script"
+        except Exception:
+            return False, "unreachable"
+
+def find_active_image(page):
+    """Locate the active fullscreen image and return (element, src, strategy)"""
+    active_selectors = [
+        '#pro-gallery-pro-gallery-fullscreen-wrapper [data-hook="item-container"][aria-hidden="false"] img[data-hook="gallery-item-image-img"]',
+        '#pro-gallery-pro-gallery-fullscreen-wrapper [data-hook="item-container"]:not([aria-hidden="true"]) img[data-hook="gallery-item-image-img"]',
+    ]
+
+    for selector in active_selectors:
+        try:
+            imgs = page.query_selector_all(selector)
+        except Exception:
+            imgs = []
+        for img in imgs:
+            try:
+                if img.is_visible():
+                    src = img.get_attribute("src") or img.get_attribute("data-src")
+                    if src:
+                        return img, src, "active"
+            except Exception:
+                continue
+
+    return None, None, None
 
 def main():
     print("="*70)
@@ -155,6 +263,7 @@ def main():
                 print("✓ Entered fullscreen gallery mode!")
             else:
                 print("WARNING: Might not be in fullscreen mode")
+            focus_gallery(page)
 
             existing_images, highest_sequence = discover_existing_images()
             if existing_images:
@@ -180,52 +289,53 @@ def main():
 
             # Download up to 50 images (safety limit)
             for i in range(50):
+                if len(session_seen_ids) >= expected_total:
+                    print("\n  ✓ All expected images have been seen")
+                    break
+
                 print(f"\n[Image {i+1}]")
+                sys.stdout.flush()
 
                 # Wait for transitions
                 time.sleep(1.5)
 
                 # Find the CURRENT/ACTIVE gallery image
-                # The gallery likely has multiple images loaded, need to find the centered/active one
+                current_img, img_src, strategy = find_active_image(page)
 
-                current_img = None
-                img_src = None
+                if not current_img:
+                    # Strategy 2: Find the image that's most centered in viewport
+                    all_gallery_imgs = page.query_selector_all('img[data-hook="gallery-item-image-img"]')
 
-                # Strategy 1: Find the image that's most centered in viewport
-                all_gallery_imgs = page.query_selector_all('img[data-hook="gallery-item-image-img"]')
+                    if len(all_gallery_imgs) > 0:
+                        print(f"  Found {len(all_gallery_imgs)} gallery images")
 
-                if len(all_gallery_imgs) > 0:
-                    print(f"  Found {len(all_gallery_imgs)} gallery images")
+                        viewport_width = 1920
+                        viewport_center = viewport_width / 2
 
-                    # Get viewport center
-                    viewport_width = 1920
-                    viewport_center = viewport_width / 2
+                        best_img = None
+                        min_distance = float('inf')
 
-                    best_img = None
-                    min_distance = float('inf')
+                        for img in all_gallery_imgs:
+                            try:
+                                if img.is_visible():
+                                    box = img.bounding_box()
+                                    if box and box['width'] > 500:
+                                        img_center = box['x'] + box['width'] / 2
+                                        distance = abs(img_center - viewport_center)
 
-                    for img in all_gallery_imgs:
-                        try:
-                            if img.is_visible():
-                                box = img.bounding_box()
-                                if box and box['width'] > 500:
-                                    # Calculate how close this image is to viewport center
-                                    img_center = box['x'] + box['width'] / 2
-                                    distance = abs(img_center - viewport_center)
+                                        if distance < min_distance:
+                                            min_distance = distance
+                                            best_img = img
 
-                                    if distance < min_distance:
-                                        min_distance = distance
-                                        best_img = img
+                            except:
+                                continue
 
-                        except:
-                            continue
+                        if best_img:
+                            current_img = best_img
+                            img_src = best_img.get_attribute('src')
+                            strategy = f"centered ({min_distance:.0f}px)"
 
-                    if best_img:
-                        current_img = best_img
-                        img_src = best_img.get_attribute('src')
-                        print(f"  Selected centered image (offset: {min_distance:.0f}px)")
-
-                # Strategy 2: Fallback to largest visible image
+                # Strategy 3: Fallback to largest visible image
                 if not current_img:
                     all_imgs = page.query_selector_all('img[src*="wixstatic.com/media/dd09ca"]')
                     max_width = 0
@@ -241,7 +351,7 @@ def main():
                         except:
                             continue
                     if current_img:
-                        print(f"  Found largest image: {max_width}px")
+                        strategy = f"largest ({max_width:.0f}px)"
 
                 if not current_img or not img_src:
                     print("  No image found")
@@ -249,6 +359,9 @@ def main():
                 if not img_src:
                     print("  No src")
                     break
+
+                if strategy:
+                    print(f"  Selected image via {strategy}")
 
                 # Get original URL
                 original_url, ext = get_original_image_url(img_src)
@@ -269,15 +382,20 @@ def main():
                 if img_id in session_seen_ids:
                     consecutive_duplicates += 1
                     print(f"  Already downloaded (dup #{consecutive_duplicates})")
-                    if consecutive_duplicates >= 10 or len(session_seen_ids) >= expected_total:
+                    if len(session_seen_ids) >= expected_total:
+                        print("  ✓ All expected images have been seen")
+                        break
+                    status, _ = get_next_arrow_state(page)
+                    if status != "enabled":
+                        reason = "arrow missing" if status == "missing" else "arrow disabled"
+                        print(f"  ✓ End of gallery detected ({reason})")
+                        break
+                    if consecutive_duplicates >= MAX_DUPLICATE_STREAK or len(session_seen_ids) >= expected_total:
                         print("\n  ✓ End of gallery detected (duplicates threshold)")
                         break
                 else:
                     consecutive_duplicates = 0
                     session_seen_ids.add(img_id)
-
-                    if len(session_seen_ids) >= expected_total:
-                        print("  ✓ All expected images have been seen")
 
                     if img_id in existing_images:
                         print("  Skipping download (already on disk)")
@@ -292,8 +410,10 @@ def main():
                             downloaded += 1
                         else:
                             print("  ✗ Download failed")
-                else:
-                    print(f"  Could not parse URL")
+
+                    if len(session_seen_ids) >= expected_total:
+                        print("  ✓ All expected images have been seen")
+                        break
 
                 # Check if we can navigate to next image
                 moved, reason = go_to_next_image(page)
@@ -321,7 +441,7 @@ def main():
             time.sleep(3)
             browser.close()
 
-    print(f"\n📁 Images: {os.path.abspath(OUTPUT_DIR)}/")
+    print(f"\n📁 Images: {OUTPUT_DIR.resolve()}/")
     print("="*70)
 
 if __name__ == "__main__":
